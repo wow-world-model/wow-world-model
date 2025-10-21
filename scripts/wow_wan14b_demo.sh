@@ -1,0 +1,1 @@
+python demo/wan_infer_demo.py --gpus 0 --port 7862 --checkpoint_path dit_models/checkpoints/WoW-1-Wan-14B-600k/wow-wan-600k-epoch=55-mp_rank_00_model_states.pt

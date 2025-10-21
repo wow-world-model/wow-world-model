@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
 import os
@@ -9,97 +9,13 @@ import gradio as gr
 from pathlib import Path
 import cv2
 import argparse
-import threading
-import sys
-import concurrent.futures
-from typing import Optional
+from diffsynth import ModelManager, WanVideoPipeline, save_video
 
-sys.path.insert(0, "ditmodels/wow_wan/DiffSynth-Studio")
-from diffsynth import ModelManager, WanVideoPipeline, save_video, wan_video
-from diffsynth.models.wan_video_dit import WanModel, sinusoidal_embedding_1d
-from diffsynth.models.wan_video_vace import VaceWanModel
-from diffsynth.models.wan_video_motion_controller import WanMotionControllerModel
+torch.serialization.add_safe_globals(['set', 'OrderedDict', 'builtins.set'])
 
-def wow_model_fn_wan_video(
-    dit: WanModel,
-    motion_controller: WanMotionControllerModel = None,
-    vace: VaceWanModel = None,
-    x: torch.Tensor = None,
-    timestep: torch.Tensor = None,
-    context: torch.Tensor = None,
-    clip_feature: Optional[torch.Tensor] = None,
-    y: Optional[torch.Tensor] = None,
-    vace_context=None,
-    vace_scale=1.0,
-    tea_cache: wan_video.TeaCache = None,
-    use_unified_sequence_parallel: bool = False,
-    motion_bucket_id: Optional[torch.Tensor] = None,
-    **kwargs,
-):
-    if use_unified_sequence_parallel:
-        import torch.distributed as dist
-        from xfuser.core.distributed import (
-            get_sequence_parallel_rank,
-            get_sequence_parallel_world_size,
-            get_sp_group,
-        )
-
-    t = dit.time_embedding(sinusoidal_embedding_1d(dit.freq_dim, timestep))
-    t_mod = dit.time_projection(t).unflatten(1, (6, dit.dim))
-    if motion_bucket_id is not None and motion_controller is not None:
-        t_mod = t_mod + motion_controller(motion_bucket_id).unflatten(1, (6, dit.dim))
-    context = dit.text_embedding(context)
-
-    if dit.has_image_input:
-        x = torch.cat([x, y], dim=1)
-        if hasattr(dit, "img_emb"):
-            clip_embdding = dit.img_emb(clip_feature)
-            context = torch.cat([clip_embdding, context], dim=1)
-
-    x = dit.patchify(x)
-    f, h, w = x.shape[2], x.shape[3], x.shape[4]
-
-    freqs = torch.cat(
-        [
-            dit.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
-            dit.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-            dit.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1),
-        ],
-        dim=-1,
-    ).reshape(f * h * w, 1, -1).to(x.device)
-
-    tea_cache_update = tea_cache.check(dit, x, t_mod) if tea_cache is not None else False
-
-    if vace_context is not None:
-        vace_hints = vace(x, vace_context, context, t_mod, freqs)
-
-    if use_unified_sequence_parallel:
-        if dist.is_initialized() and dist.get_world_size() > 1:
-            x = torch.chunk(x, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
-    if tea_cache_update:
-        x = tea_cache.update(x)
-    else:
-        for block_id, block in enumerate(dit.blocks):
-            x = block(x, context, t_mod, freqs)
-            if vace_context is not None and block_id in vace.vace_layers_mapping:
-                x = x + vace_hints[vace.vace_layers_mapping[block_id]] * vace_scale
-        if tea_cache is not None:
-            tea_cache.store(x)
-
-    x = dit.head(x, t)
-    if use_unified_sequence_parallel:
-        if dist.is_initialized() and dist.get_world_size() > 1:
-            x = get_sp_group().all_gather(x, dim=1)
-    x = dit.unpatchify(x, (f, h, w))
-    return x
-
-wan_video.model_fn_wan_video = wow_model_fn_wan_video
-
-torch.serialization.add_safe_globals(["set", "OrderedDict", "builtins.set"])
-
-FIXED_CHECKPOINT_PATH = "ditmodels/checkpoints/wan-epoch=95-train_loss=0.0265.ckpt"
 
 def extract_first_frame(video_path):
+    """Extract the first frame from a video file."""
     cap = cv2.VideoCapture(str(video_path))
     ret, frame = cap.read()
     cap.release()
@@ -108,184 +24,361 @@ def extract_first_frame(video_path):
     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     return Image.fromarray(frame_rgb)
 
-def build_pipeline(gpu_id=0, checkpoint_path=None):
+
+def preview_uploaded_file(file_path):
+    """
+    Process uploaded file for preview.
+    Returns PIL Image for both image and video files.
+    """
+    if file_path is None:
+        return None
+
+    file_path = str(file_path)
+
+    # Check if it's a video file
+    if file_path.lower().endswith(('.mp4', '.avi', '.mov', '.mkv', '.webm')):
+        try:
+            # Extract first frame from video
+            return extract_first_frame(file_path)
+        except Exception as e:
+            print(f"Error extracting frame from video: {e}")
+            return None
+    else:
+        # It's an image file, load and return it
+        try:
+            return Image.open(file_path).convert("RGB")
+        except Exception as e:
+            print(f"Error loading image: {e}")
+            return None
+
+
+def build_pipeline(gpu_id=0, checkpoint_folder=None, custom_checkpoint_name=None,
+                   enable_vram_management=True, persistent_param_gb=70):
+    """
+    Build WAN video pipeline from a checkpoint folder.
+
+    Args:
+        gpu_id: GPU device ID
+        checkpoint_folder: Path to folder containing model files. Expected structure:
+            - models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth
+            - models_t5_umt5-xxl-enc-bf16.pth
+            - Wan2.1_VAE.pth
+            - diffusion_pytorch_model-0000{1-7}-of-00007.safetensors (base models)
+        custom_checkpoint_name: Filename of custom DiT checkpoint (e.g., "WoW_video_dit.pt")
+        enable_vram_management: Enable VRAM management for memory optimization
+        persistent_param_gb: Number of GB to keep persistent in GPU (default 70GB for H800)
+    """
     device = f"cuda:{gpu_id}"
     mm = ModelManager(device="cpu")
-    mm.load_models(
-        ["ditmodels/wow_wan/models--Wan-AI--Wan2.1-I2V-14B-480P/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth"],
-        torch_dtype=torch.float32,
-    )
+
+    checkpoint_folder = Path(checkpoint_folder)
+    if not checkpoint_folder.exists():
+        raise FileNotFoundError(f"Checkpoint folder does not exist: {checkpoint_folder}")
+
+    # Define model paths
+    clip_model_path = checkpoint_folder / "models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth"
+    t5_model_path = checkpoint_folder / "models_t5_umt5-xxl-enc-bf16.pth"
+    vae_model_path = checkpoint_folder / "Wan2.1_VAE.pth"
     dit_paths = [
-        f"ditmodels/wow_wan/models--Wan-AI--Wan2.1-I2V-14B-480P/diffusion_pytorch_model-0000{i}-of-00007.safetensors"
+        str(checkpoint_folder / f"diffusion_pytorch_model-0000{i}-of-00007.safetensors")
         for i in range(1, 8)
     ]
+
+    # Load CLIP model
+    print("📦 Loading CLIP image encoder...")
+    mm.load_models([str(clip_model_path)], torch_dtype=torch.float32)
+
+    # Load DiT, T5, and VAE models
+    print("📦 Loading DiT, T5 text encoder and VAE...")
     mm.load_models(
-        [
-            dit_paths,
-            "ditmodels/wow_wan/models--Wan-AI--Wan2.1-I2V-14B-480P/models_t5_umt5-xxl-enc-bf16.pth",
-            "ditmodels/wow_wan/models--Wan-AI--Wan2.1-I2V-14B-480P/Wan2.1_VAE.pth",
-        ],
+        [dit_paths, str(t5_model_path), str(vae_model_path)],
         torch_dtype=torch.bfloat16,
     )
-    if checkpoint_path:
-        checkpoint_file = Path(checkpoint_path) / "checkpoint" / "mp_rank_00_model_states.pt"
-        if not checkpoint_file.exists():
-            raise FileNotFoundError(f"Model file does not exist: {checkpoint_file}")
-        state_dict = torch.load(str(checkpoint_file), map_location="cpu")
-        dit_model = mm.fetch_model("wan_video_dit")
-        if dit_model is not None:
-            dit_model.load_state_dict(state_dict, strict=False)
+
+    # Check for custom checkpoint
+    if custom_checkpoint_name:
+        custom_checkpoint = checkpoint_folder / custom_checkpoint_name
+        if custom_checkpoint.exists():
+            print(f"🎯 Loading custom DiT checkpoint: {custom_checkpoint}")
+            state_dict = torch.load(str(custom_checkpoint), map_location="cpu")
+
+            dit_model = mm.fetch_model("wan_video_dit")
+            if dit_model is not None:
+                dit_model.load_state_dict(state_dict, strict=False)
+                print("✅ Custom DiT checkpoint loaded successfully")
+        else:
+            print(f"⚠️  Custom checkpoint not found: {custom_checkpoint}")
+            print("   Continuing with base DiT model...")
+
+    # Build pipeline
     pipe = WanVideoPipeline.from_model_manager(mm, torch_dtype=torch.bfloat16, device=device)
-    pipe.enable_vram_management(num_persistent_param_in_dit=60 * 10**9)
+
+    # Configure VRAM management for optimal performance
+    if enable_vram_management:
+        num_persistent_params = int(persistent_param_gb * 10**9)
+        pipe.enable_vram_management(num_persistent_param_in_dit=num_persistent_params)
+        print(f"✅ VRAM management enabled: {persistent_param_gb}GB persistent params")
+    else:
+        print("⚠️  VRAM management disabled (may cause OOM on large models)")
+
+    print(f"✅ Pipeline built successfully on {device}")
     return pipe
 
-PIPES = {}
-LOCKS = {}
-EXECUTORS = {}
-FUTURES = {}
-STOP_FLAGS = {}
 
-def generate_video(prompt, input_file, gpu_id, steps=30, seed=42, tiled=True, num_frames=80, width=832, height=480, stop_event=None):
-    if isinstance(gpu_id, (str,)):
-        try:
-            gpu_id = int(float(gpu_id))
-        except Exception:
-            gpu_id = None
-    try:
-        gpu_id = int(gpu_id)
-    except Exception:
-        gpu_id = None
+# Global model variable
+pipe = None
+
+
+def generate_video(prompt, input_file, gpu_id, steps=50, seed=42, tiled=True, num_frames=41):
+    """Generate video from input image and text prompt."""
+    global pipe
 
     if not prompt or input_file is None:
-        return "Prompt and input image are required", None
+        return "❌ Error: Prompt and input image are required", None
 
-    if not PIPES:
-        return "Model(s) not loaded, please check startup logs", None
-    if stop_event is not None and stop_event.is_set():
-        return "Stopped by user.", None
+    if pipe is None:
+        return "❌ Error: Model not loaded, please check the startup logic", None
 
-    if gpu_id in PIPES:
-        pipe = PIPES[gpu_id]
-        lock = LOCKS[gpu_id]
+    # Extract image from input file
+    # input_file is a filepath string from gr.File
+    if isinstance(input_file, str) and input_file.lower().endswith((".mp4", ".avi", ".mov", ".mkv", ".webm")):
+        input_image = extract_first_frame(input_file)
     else:
-        fallback_gpu = next(iter(PIPES))
-        pipe = PIPES[fallback_gpu]
-        lock = LOCKS[fallback_gpu]
-
-    if hasattr(input_file, "name") and input_file.name.lower().endswith(".mp4"):
-        input_image = extract_first_frame(input_file.name)
-    else:
+        # For image files, load directly
         input_image = Image.open(input_file).convert("RGB")
 
-    with lock:
-        video = pipe(
-            prompt=prompt,
-            negative_prompt="low quality, distorted, ugly, bad anatomy",
-            input_image=input_image,
-            num_inference_steps=steps,
-            seed=seed,
-            tiled=tiled,
-            num_frames=num_frames,
-            width=width,
-            height=height,
-        )
-        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmpfile:
-            output_path = tmpfile.name
-        save_video(video, output_path, fps=16, quality=5)
-    return "Generation successful!", output_path
+    # Generate video
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmpfile:
+        output_path = tmpfile.name
+
+    video = pipe(
+        prompt=prompt,
+        negative_prompt="low quality, distorted, ugly, bad anatomy",
+        input_image=input_image,
+        num_inference_steps=steps,
+        seed=seed,
+        tiled=tiled,
+        num_frames=num_frames,
+    )
+
+    save_video(video, output_path, fps=15, quality=5)
+    return "✅ Generation successful!", output_path
+
 
 def build_interface():
-    with gr.Blocks(title="Wow Video Generation") as demo:
-        gr.Markdown("## 🎬 Wow Video Generation — Multi-GPU Panels")
-        gr.Markdown("Each GPU has its own panel. You can submit multiple tasks in parallel (different GPUs run concurrently, same GPU runs sequentially).")
-        if not PIPES:
-            gr.Markdown("**No models loaded. Please specify --gpus at startup.**")
-            return demo
+    """Build Gradio interface with custom theme."""
+
+    # Create custom theme with cool, modern design
+    theme = gr.themes.Soft(
+        primary_hue="blue",
+        secondary_hue="cyan",
+        neutral_hue="slate",
+        font=gr.themes.GoogleFont("Inter"),
+    ).set(
+        body_background_fill="linear-gradient(135deg, #667eea 0%, #764ba2 100%)",
+        body_background_fill_dark="linear-gradient(135deg, #1a1a2e 0%, #16213e 100%)",
+        button_primary_background_fill="linear-gradient(90deg, #667eea 0%, #764ba2 100%)",
+        button_primary_background_fill_hover="linear-gradient(90deg, #764ba2 0%, #667eea 100%)",
+        button_primary_text_color="white",
+        block_title_text_weight="600",
+        block_label_text_weight="600",
+        input_background_fill="#ffffff",
+        input_background_fill_dark="#2d3748",
+    )
+
+    with gr.Blocks(
+        title="WoW Video Generation Demo",
+        theme=theme,
+        css="""
+        .gradio-container {
+            max-width: 1400px !important;
+        }
+        .main-header {
+            text-align: center;
+            color: #ffffff !important;
+            font-size: 2.8em !important;
+            font-weight: 800 !important;
+            margin-bottom: 0.3em;
+            text-shadow: 0 4px 12px rgba(0, 0, 0, 0.3), 0 2px 4px rgba(0, 0, 0, 0.2);
+        }
+        .subtitle {
+            text-align: center;
+            color: #e2e8f0;
+            font-size: 1.15em;
+            margin-bottom: 2em;
+            text-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+        }
+        """
+    ) as demo:
+        gr.Markdown(
+            """
+            <h1 class="main-header">🎬 WoW World Generation Studio</h1>
+            <p class="subtitle">Transform images into robot manipulation videos with AI-powered world models</p>
+            """
+        )
+
         with gr.Row():
-            for g in sorted(PIPES.keys()):
-                with gr.Column():
-                    gr.Markdown(f"### GPU {g}")
-                    inp = gr.File(label="Upload image or video (.jpg/.png/.mp4)", interactive=True)
-                    prm = gr.Textbox(label="Text prompt", placeholder="Describe the scene...")
-                    steps = gr.Slider(1, 100, value=30, step=1, label="Inference steps")
-                    seed = gr.Number(label="Random seed", value=42, precision=0)
-                    tiled = gr.Checkbox(label="Use Tiled mode", value=True)
-                    num_frames = gr.Slider(1, 120, value=80, step=1, label="Number of frames")
-                    width = gr.Number(label="Width", value=832, precision=0)
-                    height = gr.Number(label="Height", value=480, precision=0)
-                    gen_btn = gr.Button(f"🚀 Generate on GPU {g}")
-                    stop_btn = gr.Button(f"🛑 Stop on GPU {g}")
-                    status = gr.Textbox(label="Status")
-                    out_vid = gr.Video(label="Generated video", format="mp4")
+            with gr.Column(scale=1):
+                # File upload component
+                input_file = gr.File(
+                    label="📁 Upload Input Image or Video",
+                    file_types=["image", "video"],
+                    type="filepath",
+                )
+                # Preview component
+                input_preview = gr.Image(
+                    label="📸 Preview (First Frame)",
+                    interactive=False,
+                    height=300,
+                )
+                prompt = gr.Textbox(
+                    label="✨ Text Prompt",
+                    placeholder="Describe the action or scene you want to generate, e.g., 'A Franka robot put the screw driver into the drawer'",
+                    lines=3,
+                )
 
-                    if g not in EXECUTORS:
-                        EXECUTORS[g] = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-                    if g not in STOP_FLAGS:
-                        STOP_FLAGS[g] = threading.Event()
-
-                    def start_task(prompt, input_file, steps_v, seed_v, tiled_v, num_frames_v, width_v, height_v, status, out_vid, gpu_id=g):
-                        STOP_FLAGS[gpu_id].set()
-                        status = ""
-                        out_vid = None
-                        STOP_FLAGS[gpu_id] = threading.Event()
-                        result_status, result_video = generate_video(
-                            prompt, input_file, gpu_id,
-                            int(steps_v), int(seed_v), bool(tiled_v), int(num_frames_v),
-                            int(width_v), int(height_v),
-                            STOP_FLAGS[gpu_id]
+                with gr.Accordion("⚙️ Advanced Settings", open=False):
+                    with gr.Row():
+                        steps = gr.Slider(
+                            1, 100,
+                            value=50,
+                            step=1,
+                            label="Inference Steps",
                         )
-                        return result_status, result_video
+                        num_frames = gr.Slider(
+                            1, 100,
+                            value=41,
+                            step=1,
+                            label="Number of Frames",
+                        )
 
-                    def stop_task():
-                        STOP_FLAGS[g].set()
-                        return "Stopped.", None
+                    with gr.Row():
+                        seed = gr.Number(
+                            label="Random Seed",
+                            value=42,
+                            precision=0,
+                        )
+                        gpu_id = gr.Number(
+                            label="GPU ID",
+                            value=0,
+                            precision=0,
+                        )
 
-                    gen_btn.click(
-                        start_task,
-                        inputs=[prm, inp, steps, seed, tiled, num_frames, width, height, status, out_vid],
-                        outputs=[status, out_vid],
+                    tiled = gr.Checkbox(
+                        label="Use Tiled Mode (better memory efficiency)",
+                        value=True,
                     )
-                    stop_btn.click(
-                        stop_task,
-                        inputs=[],
-                        outputs=[status, out_vid],
-                    )
+
+                generate_btn = gr.Button(
+                    "🚀 Generate Video",
+                    variant="primary",
+                    size="lg",
+                )
+
+            with gr.Column(scale=1):
+                status = gr.Textbox(
+                    label="📊 Status",
+                    interactive=False,
+                )
+                output_video = gr.Video(
+                    label="🎥 Generated Video",
+                    format="mp4",
+                )
+
+        gr.Markdown(
+            """
+            ---
+            ### 💡 Tips & Guidelines
+            - **Input**: Upload an image (.jpg, .png) or video (.mp4, .avi, .mov) - preview shows first frame
+            - **Prompt**: Write a detailed description of the action or scene you want to generate
+            - **Steps**: Higher values (50-100) = better quality but slower generation
+            - **Frames**: Control video length (more frames = longer video)
+            - **Tiled Mode**: Enable to reduce memory usage for longer/higher resolution videos
+            - **Seed**: Use same seed for reproducible results
+            """
+        )
+
+        # Update preview when file is uploaded
+        input_file.change(
+            fn=preview_uploaded_file,
+            inputs=[input_file],
+            outputs=[input_preview],
+        )
+
+        # Generate video button
+        generate_btn.click(
+            fn=generate_video,
+            inputs=[prompt, input_file, gpu_id, steps, seed, tiled, num_frames],
+            outputs=[status, output_video],
+        )
+
     return demo
 
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--port", type=int, default=7620, help="Gradio server port")
-    parser.add_argument("--gpus", type=str, default="0", help="Comma-separated GPU IDs to preload")
-    parser.add_argument("--share", action="store_true", help="Whether to create a public link")
+    parser = argparse.ArgumentParser(description="WoW Video Generation Demo")
+    parser.add_argument("--port", type=int, default=7860, help="Gradio server port")
+    parser.add_argument("--gpu", type=int, default=0, help="GPU ID")
+    parser.add_argument(
+        "--checkpoint_folder",
+        type=str,
+        default="dit_models/checkpoints/WoW-1-Wan-14B-600k",
+        help="Path to folder containing WAN model files (base models + optional custom checkpoint)"
+    )
+    parser.add_argument(
+        "--custom_checkpoint",
+        type=str,
+        default="WoW_video_dit.pt",
+        help="Filename of custom DiT checkpoint (e.g., 'WoW_video_dit.pt', 'custom_model.pt')"
+    )
+    parser.add_argument(
+        "--enable_vram_management",
+        action="store_true",
+        default=True,
+        help="Enable VRAM management for memory optimization (recommended)"
+    )
+    parser.add_argument(
+        "--no_vram_management",
+        action="store_true",
+        help="Disable VRAM management (use full GPU memory, may cause OOM)"
+    )
+    parser.add_argument(
+        "--persistent_param_gb",
+        type=int,
+        default=70,
+        help="GB of model parameters to keep persistent in GPU memory (default: 70GB for H800, adjust for your GPU)"
+    )
+    parser.add_argument("--share", action="store_true", help="Create a public link")
     args = parser.parse_args()
 
-    gpu_list = []
-    for x in args.gpus.split(","):
-        x = x.strip()
-        if x == "":
-            continue
-        try:
-            gpu_list.append(int(x))
-        except ValueError:
-            continue
-    if not gpu_list:
-        gpu_list = [0]
+    # Handle VRAM management flag logic
+    enable_vram = args.enable_vram_management and not args.no_vram_management
 
-    print(f"🚀 Loading models to GPUs: {gpu_list}, please wait...")
+    print("=" * 60)
+    print(f"🎬 WoW Video Generation Demo")
+    print("=" * 60)
+    print(f"📍 Checkpoint folder: {args.checkpoint_folder}")
+    print(f"📦 Custom checkpoint: {args.custom_checkpoint}")
+    print(f"🎮 GPU ID: {args.gpu}")
+    print(f"🌐 Port: {args.port}")
+    print(f"💾 VRAM Management: {'Enabled' if enable_vram else 'Disabled'}")
+    if enable_vram:
+        print(f"   Persistent Params: {args.persistent_param_gb}GB")
+    print("=" * 60)
+    print("⏳ Loading model, please wait...")
 
-    for g in gpu_list:
-        try:
-            p = build_pipeline(gpu_id=g, checkpoint_path=FIXED_CHECKPOINT_PATH)
-            PIPES[g] = p
-            LOCKS[g] = threading.Lock()
-            print(f"✅ Loaded pipe on cuda:{g}")
-        except Exception as e:
-            print(f"❌ Failed to load model on cuda:{g}: {e}")
+    pipe = build_pipeline(
+        gpu_id=args.gpu,
+        checkpoint_folder=args.checkpoint_folder,
+        custom_checkpoint_name=args.custom_checkpoint,
+        enable_vram_management=enable_vram,
+        persistent_param_gb=args.persistent_param_gb
+    )
 
-    if not PIPES:
-        raise RuntimeError("No models loaded. Exiting.")
-
-    print("✅ Models loaded. Launching Gradio interface...")
+    print("=" * 60)
+    print("✅ Model loaded successfully!")
+    print("🚀 Launching Gradio interface...")
+    print("=" * 60)
 
     demo = build_interface()
     demo.launch(server_port=args.port, share=args.share)
