@@ -16,17 +16,27 @@ WoW (World-Omniscient World Model) is a 14B-parameter generative world model tra
 
 ### 1. Install Dependencies
 
+For Wan based models, follow the demo/README.md (recommand)
+
 For Cosmos based DiT models:
 
 ```bash
 pip install -r dit_models/wow-dit-2b/requires.txt
 ```
 
-For Wan based models, follow the demo/README.md
 
 ### 2. Run Demo Scripts
 
-#### A. DiT Scripts
+#### A. Wan Scripts (recommended)
+
+- Run the Wan demo:
+
+```bash
+python demo/wan_infer_demo.py 
+```
+
+
+#### B. DiT Scripts(Develop version)
 
 - Example: Inference with 2B DiT model
 
@@ -40,13 +50,6 @@ python scripts/infer_wow_dit_2b.py --help
 python scripts/infer_wow_dit_7b.py --help
 ```
 
-#### B. Wan Scripts
-
-- Run the Wan demo:
-
-```bash
-python demo/wan_infer_demo.py 
-```
 
 - For custom input or parameters, please refer to comments in the corresponding demo scripts.
 
@@ -61,8 +64,8 @@ We have released the following models and datasets on [Hugging Face](https://hug
 | WoW-1-DiT-2B-600k | 2B | 600k | [🔗 Link](https://huggingface.co/WoW-world-model/WoW-1-DiT-2B-600k) |
 | WoW-1-DiT-7B-600k | 7B | 600k | [🔗 Link](https://huggingface.co/WoW-world-model/WoW-1-DiT-7B-600k) |
 | WoW-1-Wan-14B-600k | 14B | 600k | [🔗 Link](https://huggingface.co/WoW-world-model/WoW-1-Wan-14B-600k) |
-| WoW-1-Wan-14B-2M | 14B | 2M | [🔗 Coming Soon](https://huggingface.co/WoW-world-model/WoW-1-Wan-14B-2M) |
-| Wan-1-Wan-1.3B-2M | 14B | 2M | [🔗 Coming Soon](https://huggingface.co/WoW-world-model/Wan-1-Wan-14B-600k) |
+| **(🔥Recommand!)WoW-1-Wan-14B-2M** | 14B | 2M | [🔗 Link](https://huggingface.co/WoW-world-model/WoW-1-Wan-14B-2M) |
+| Wan-1-Wan-1.3B-2M | 1.3B | 2M | [🔗 Coming Soon](https://huggingface.co/WoW-world-model/Wan-1-Wan-14B-600k) |
 
 ### 📊 Benchmark Dataset
 
