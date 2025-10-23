@@ -28,6 +28,7 @@ A concise implementation of image-to-action models using DINO and Co-Tracker fea
 - numpy
 - Internet access for torch.hub to download `facebookresearch/co-tracker` (if used)
 - (Optional) Video-Depth-Anything if dataset utilities rely on it
+- (Optional) If you want to perform robotic arm segmentation, please refer to the environment setup of SAM2.
 
 Install example:
 ```bash
