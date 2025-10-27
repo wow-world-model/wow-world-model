@@ -565,8 +565,9 @@ def model_fn_wan_video(
     
     if dit.has_image_input:
         x = torch.cat([x, y], dim=1)  # (b, c_x + c_y, f, h, w)
-        clip_embdding = dit.img_emb(clip_feature)
-        context = torch.cat([clip_embdding, context], dim=1)
+        if hasattr(dit, 'img_emb'):
+            clip_embdding = dit.img_emb(clip_feature)
+            context = torch.cat([clip_embdding, context], dim=1)
     
     x, (f, h, w) = dit.patchify(x)
     
