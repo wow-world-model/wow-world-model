@@ -81,7 +81,7 @@ def ensure_in_channels_32_before_lora(model=None):
         print("[WARN] denoising model has no patch_embedding; please verify architecture")
 
 
-def build_pipeline(gpu_id=0, base_model_folder=None, checkpoint_path=None, enable_vram_management=True, persistent_param_gb=60):
+def build_pipeline(gpu_id=0, base_model_folder=None, enable_vram_management=True, persistent_param_gb=60):
     """
     Build WAN 1.3B I2V pipeline from base models and optional checkpoint.
 
@@ -92,7 +92,6 @@ def build_pipeline(gpu_id=0, base_model_folder=None, checkpoint_path=None, enabl
             - models_t5_umt5-xxl-enc-bf16.pth
             - Wan2.1_VAE.pth
             - diffusion_pytorch_model.safetensors
-        checkpoint_path: Path to custom checkpoint folder (e.g., "output/wan_1.3B_full_2000k_2/checkpoints/wan-epoch=93-train_loss=0.0491.ckpt")
         enable_vram_management: Enable VRAM management for memory optimization
         persistent_param_gb: Number of GB to keep persistent in GPU (default 60GB for 1.3B)
     """
@@ -123,29 +122,22 @@ def build_pipeline(gpu_id=0, base_model_folder=None, checkpoint_path=None, enabl
     )
 
     # Check for custom checkpoint
-    if checkpoint_path:
-        checkpoint_path_obj = Path(checkpoint_path)
-        if checkpoint_path_obj.exists():
-            print(f"🎯 Loading custom checkpoint: {checkpoint_path}")
-            checkpoint_file = checkpoint_path_obj / "checkpoint" / "mp_rank_00_model_states.pt"
-            
-            if not checkpoint_file.exists():
-                print(f"⚠️  Checkpoint file not found: {checkpoint_file}")
-                print("   Continuing with base model...")
-            else:
-                try:
-                    state_dict = torch.load(str(checkpoint_file), map_location="cpu")
-                    dit_model = mm.fetch_model("wan_video_dit")
-                    if dit_model is not None:
-                        ensure_in_channels_32_before_lora(dit_model)
-                        dit_model.load_state_dict(state_dict, strict=False)
-                        dit_model.has_image_input = True
-                        print("✅ Custom checkpoint loaded successfully")
-                except Exception as e:
-                    print(f"⚠️  Failed to load custom checkpoint: {e}")
-                    print("   Continuing with base model...")
-        else:
-            print(f"⚠️  Checkpoint path does not exist: {checkpoint_path}")
+    checkpoint_file = base_model_folder / "WoW_video_dit.pt"
+    print(f"🎯 Loading custom checkpoint: {checkpoint_file}")
+    if not checkpoint_file.exists():
+        print(f"⚠️  Checkpoint file not found: {checkpoint_file}")
+        print("   Continuing with base model...")
+    else:
+        try:
+            state_dict = torch.load(str(checkpoint_file), map_location="cpu")
+            dit_model = mm.fetch_model("wan_video_dit")
+            if dit_model is not None:
+                ensure_in_channels_32_before_lora(dit_model)
+                dit_model.load_state_dict(state_dict, strict=False)
+                dit_model.has_image_input = True
+                print("✅ Custom checkpoint loaded successfully")
+        except Exception as e:
+            print(f"⚠️  Failed to load custom checkpoint: {e}")
             print("   Continuing with base model...")
 
     # Build pipeline
@@ -368,12 +360,6 @@ if __name__ == "__main__":
         help="Path to folder containing 1.3B base model files"
     )
     parser.add_argument(
-        "--checkpoint",
-        type=str,
-        default=None,
-        help="Path to custom checkpoint folder (e.g., 'output/wan_1.3B_full_2000k_2/checkpoints/wan-epoch=93-train_loss=0.0491.ckpt')"
-    )
-    parser.add_argument(
         "--enable_vram_management",
         action="store_true",
         default=True,
@@ -400,10 +386,6 @@ if __name__ == "__main__":
     print(f"🎬 WoW Video Generation Demo (1.3B I2V)")
     print("=" * 60)
     print(f"📍 Base model folder: {args.base_model_folder}")
-    if args.checkpoint:
-        print(f"📦 Custom checkpoint: {args.checkpoint}")
-    else:
-        print(f"📦 Custom checkpoint: None (using base model)")
     print(f"🎮 GPU ID: {args.gpu}")
     print(f"🌐 Port: {args.port}")
     print(f"💾 VRAM Management: {'Enabled' if enable_vram else 'Disabled'}")
@@ -415,7 +397,6 @@ if __name__ == "__main__":
     pipe = build_pipeline(
         gpu_id=args.gpu,
         base_model_folder=args.base_model_folder,
-        checkpoint_path=args.checkpoint,
         enable_vram_management=enable_vram,
         persistent_param_gb=args.persistent_param_gb
     )
