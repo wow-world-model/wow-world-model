@@ -65,7 +65,7 @@ We have released the following models and datasets on [Hugging Face](https://hug
 | WoW-1-DiT-7B-600k | 7B | 600k | [🔗 Link](https://huggingface.co/WoW-world-model/WoW-1-DiT-7B-600k) |
 | WoW-1-Wan-14B-600k | 14B | 600k | [🔗 Link](https://huggingface.co/WoW-world-model/WoW-1-Wan-14B-600k) |
 | **(🔥Recommand!)WoW-1-Wan-14B-2M** | 14B | 2M | [🔗 Link](https://huggingface.co/WoW-world-model/WoW-1-Wan-14B-2M) |
-| Wan-1-Wan-1.3B-2M | 1.3B | 2M | [🔗 Coming Soon](https://huggingface.co/WoW-world-model/Wan-1-Wan-14B-600k) |
+| Wan-1-Wan-1.3B-2M | 1.3B | 2M | [🔗 Link](https://huggingface.co/WoW-world-model/WoW-1-Wan-1.3B-2M) |
 
 ### 📊 Benchmark Dataset
 
